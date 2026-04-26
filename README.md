@@ -34,6 +34,20 @@ plane plus the H.264/RTP video stream — enough to take the dash from
   on/off TLVs, route-card keep-alive, nav-info instruction bubble).
 - Streams an H.264 video file (any container ffmpeg can read) over RTP
   to UDP/5000. The dash decodes it on its embedded H.264 decoder.
+- Streams a **live custom UI** rendered in Python (the `dash_ui` package),
+  and reacts to the bike's joystick / click events live (LEFT, RIGHT,
+  DOWN, CLICK).
+
+
+## What's in this repo
+
+| File / dir | Role |
+|---|---|
+| `tripper_app_like_nav.py` | Standalone script: auth + nav-mode handshake + 1 Hz tick + RTP video stream from any file. Best entry point if you just want to "send video to the dash". |
+| `dash_ui/` | Python package that renders an interactive UI live (pygame), encodes it to H.264, packetises it as RTP, and forwards bike-button events back into the renderer. Imports the K1G primitives from `tripper_app_like_nav.py` for the control plane. |
+| `dash_ui/prototype.py` | CLI prototype: full end-to-end "connect to dash + stream UI + react to buttons". |
+| `dash_ui/local_test.py` | Local-only harness: opens a Mac window and drives the renderer with the keyboard (no bike, no network). Use this to iterate on the UI fast. |
+| `requirements.txt` | Python dependencies. |
 
 
 ## Install
@@ -46,13 +60,20 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 pip install --upgrade pip
-pip install cryptography     # required for the RSA/AES auth handshake
-brew install ffmpeg          # macOS — script invokes the `ffmpeg` binary
-                             # On Debian/Ubuntu: sudo apt install ffmpeg
+pip install -r requirements.txt   # cryptography + pygame-ce
+brew install ffmpeg               # macOS — script invokes the `ffmpeg` binary
+                                  # On Debian/Ubuntu: sudo apt install ffmpeg
 ```
 
-`cryptography` is the only Python dependency; the rest of the script
-is stdlib.
+`cryptography` is required for the auth handshake.  `pygame-ce` is only
+required for the interactive `dash_ui` prototype — `tripper_app_like_nav.py`
+on its own only needs `cryptography` + `ffmpeg`.
+
+> **Note on pygame:** the upstream `pygame` package (2.6.1) has a known
+> `pygame.font` circular-import bug on Python 3.13/3.14 that makes all
+> text invisible.  We use `pygame-ce` (the community fork — 100% drop-in
+> compatible) instead.  If you already have `pygame` installed, run
+> `pip uninstall -y pygame && pip install pygame-ce`.
 
 ## Connect to the dash
 
@@ -111,6 +132,98 @@ The script has a lot of knobs; the ones you'll touch most often:
 Run `python tripper_app_like_nav.py --help` for the full list (battery
 percentage, GPS-on/off, music/alarm volume placeholders, nav-info
 maneuver code, distance unit, …).
+
+## Custom UI prototype (`dash_ui`)
+
+`dash_ui` is a Python package that renders an interactive UI in pygame,
+encodes it on the fly into H.264, packetises it as RTP and ships it to
+the dash on UDP/5000.  In parallel, it listens on UDP/2002 for the
+bike's joystick events and forwards them into the renderer's event
+queue, so the dash's LEFT / RIGHT / DOWN / CLICK buttons drive the
+on-screen menu.
+
+This is what was used to record the dash photo of a four-row menu
+("Speed / Map / Music / Settings") with a yellow highlight and live
+button feedback.
+
+### Local development (no bike needed)
+
+The fastest iteration loop: `local_test.py` opens a Mac window with
+the same renderer the dash sees, and maps the Mac keyboard to the
+same `Button` events `bike_link.py` would deliver from UDP/2002.
+
+```bash
+source .venv/bin/activate
+python -m dash_ui.local_test --scale 2   # 1052x600 window (526x300 ×2)
+```
+
+| Key | Bike button |
+|---|---|
+| ← / `a` | LEFT |
+| → / `d` | RIGHT |
+| ↓ / `s` / ↑ / `w` | DOWN (bike has no UP) |
+| Enter / Space | CLICK |
+| Esc / `q` | quit |
+
+### Stream the UI to the dash
+
+Once your Mac is on the dash's Wi-Fi (same prerequisites as the
+plain video stream above):
+
+```bash
+python -m dash_ui.prototype --ssid RE_xxxx_yymmdd --fps 12
+```
+
+You should see:
+
+1. The same UI you saw in `local_test.py` appear on the dash's TFT.
+2. Pressing the joystick on the bike (LEFT / RIGHT / DOWN / CLICK)
+   moves the highlight and toggles the detail panel.
+3. Selecting **Video** + DOWN plays the file passed to `--video-file`
+   (defaults to `test_640.mp4` in the working directory).
+
+Useful flags for the prototype:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--ssid` | _(required)_ | Same as `tripper_app_like_nav.py`. |
+| `--fps` | 8 | UI / encoder frame rate. The stock phone uses 4 fps; 8–12 is more responsive but pushes the dash decoder. Drop back to 4 if the dash blinks. |
+| `--bitrate-kbps` | 205 | H.264 bitrate. Bump to 300–450 if you raised the fps. |
+| `--rtp-payload` | 1380 | Max RTP payload bytes. Lower to 1000/1200 if you see Wi-Fi loss. |
+| `--video-file` | `test_640.mp4` | File played by the **Video** menu item. |
+| `--calibration-grid` | off | Stream a grid + concentric circles instead of the menu — useful for finding the round dash's safe area. |
+| `--windowed` | off | Also show the renderer in a Mac window for debugging. |
+| `--fake-buttons` | off | Inject LEFT/RIGHT/DOWN/CLICK on a 1.5 s timer (for verifying the UI reacts before the bike is on). |
+| `--no-auth` | off | Skip the RSA handshake (protocol experiments only). |
+
+### Bike-side button events
+
+While streaming, the dash sends joystick / click events on UDP/2002 as
+`09 00 0001 XX` segments.  Discovered byte values:
+
+| Bytes | Button |
+|---|---|
+| `09 00 0001 13` | RIGHT |
+| `09 00 0001 14` | LEFT |
+| `09 00 0001 15` | DOWN |
+| `09 00 0001 18` | CLICK (followed by `05 …` and `09 …` segments) |
+
+`bike_link.py` echoes a `06 80 0001 XX` ack back to the dash (same
+shape as the existing `q3c.r2 / u2 / …` acks) and dispatches each
+event to the renderer via the `on_button` callback.
+
+### How to extend the UI
+
+`dash_ui/pygame_renderer.py` is the only file you need to edit to
+change the look.  Modify `MENU_ITEMS`, the `_apply()` button handler,
+and `_draw()` to add new screens / behaviours; everything else
+(encoder, RTP packetizer, K1G handshake, button RX, route-card
+keep-alive) is plumbing you do not need to touch.
+
+If you want to write a renderer that isn't pygame (e.g. an OpenGL
+off-screen framebuffer or a web view), implement the `Renderer`
+protocol from `dash_ui/renderer.py` — it's just `width`, `height`,
+`fps`, and `render_frame() → bytes` (RGB24).
 
 ## Disclaimer
 
