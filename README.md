@@ -8,6 +8,25 @@ joined to the dash's Wi-Fi access point and reproduces the K1G/UDP control
 plane plus the H.264/RTP video stream — enough to take the dash from
 `Connected` → `Navigation` and play arbitrary video on its TFT.
 
+## Roadmap
+
+### Phase 1 — Testing & refinement
+- [ ] Improve stream framerate beyond 4 fps
+- [ ] Understand bike button controls & auxiliary messages (UDP/2002)
+- [ ] Pi software — auto-connect to Tripper WiFi & launch UI headlessly
+
+### Phase 2 — Raspberry Pi as a standalone
+- [ ] Port Python script to Raspberry Pi Zero
+- [ ] Bluetooth GPX ingestion from phone before ride
+- [ ] Custom navigation UI (turn-by-turn, 526×300)
+- [ ] Plug-and-play install (pre-flashed SD image)
+
+### Side branch — Android Auto
+> Parallel effort — stream Android Auto interface to the Tripper dash.
+> Separate branch, won't affect the main roadmap.
+- [ ] Investigate AA protocol compatibility with Tripper WiFi stack
+- [ ] Community contributors welcome
+
 ## What works today
 
 - Authenticates with the dash (RSA-encrypted session-key handshake).
