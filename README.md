@@ -79,7 +79,7 @@ on its own only needs `cryptography` + `ffmpeg`.
 
 1. On the bike, enable the Tripper Wi-Fi (the menu shows the SSID and
    the AP comes up as something like `RE_xxxx_yymmdd`).
-2. On the Mac, join that Wi-Fi network. There is no password.
+2. On the Mac, join that Wi-Fi network. The password is **`12345678`**.
 3. Confirm you got an IP on the `192.168.1.x` subnet. The dash itself
    is **`192.168.1.1`**.
 
