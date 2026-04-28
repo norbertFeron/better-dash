@@ -1,5 +1,8 @@
 # Required for tripper_app_like_nav.py and dash_ui:
 cryptography>=41.0          # RSA/AES auth handshake with the dash
 
-# Required only for the dash_ui prototype (interactive UI):
+# Required only for the dash_ui prototype (interactive UI — pygame renderer):
 pygame-ce>=2.5              # community pygame fork; works on Python 3.13/3.14
+
+# Required only for the Qt UI (qt_renderer / qt_prototype / qt_local_test):
+PySide6>=6.6                # Qt6 Python bindings (GPU-accelerated, sub-pixel text)

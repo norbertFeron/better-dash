@@ -11,14 +11,14 @@ plane plus the H.264/RTP video stream — enough to take the dash from
 ## Roadmap
 
 ### Phase 1 — Testing & refinement
-- [ ] Improve stream framerate beyond 4 fps
-- [ ] Understand bike button controls & auxiliary messages (UDP/2002)
+- [x] Improve stream framerate beyond 4 fps
+- [x] Understand bike button controls & auxiliary messages (UDP/2002)
 - [ ] Pi software — auto-connect to Tripper WiFi & launch UI headlessly
 
 ### Phase 2 — Raspberry Pi as a standalone
 - [ ] Port Python script to Raspberry Pi Zero
 - [ ] Bluetooth GPX ingestion from phone before ride
-- [ ] Custom navigation UI (turn-by-turn, 526×300)
+- [x] Custom navigation UI (turn-by-turn, 526×300) — **Qt UI now in `dash_ui/`**
 - [ ] Plug-and-play install (pre-flashed SD image)
 
 ### Side branch — Android Auto
@@ -37,6 +37,9 @@ plane plus the H.264/RTP video stream — enough to take the dash from
 - Streams a **live custom UI** rendered in Python (the `dash_ui` package),
   and reacts to the bike's joystick / click events live (LEFT, RIGHT,
   DOWN, CLICK).
+- **Qt-based UI** (`qt_renderer.py`) with smooth gradients, real font
+  hinting, and an interactive map view that follows a GPX track with
+  pre-cached OSM tiles.
 
 
 ## What's in this repo
@@ -44,9 +47,17 @@ plane plus the H.264/RTP video stream — enough to take the dash from
 | File / dir | Role |
 |---|---|
 | `tripper_app_like_nav.py` | Standalone script: auth + nav-mode handshake + 1 Hz tick + RTP video stream from any file. Best entry point if you just want to "send video to the dash". |
-| `dash_ui/` | Python package that renders an interactive UI live (pygame), encodes it to H.264, packetises it as RTP, and forwards bike-button events back into the renderer. Imports the K1G primitives from `tripper_app_like_nav.py` for the control plane. |
-| `dash_ui/prototype.py` | CLI prototype: full end-to-end "connect to dash + stream UI + react to buttons". |
-| `dash_ui/local_test.py` | Local-only harness: opens a Mac window and drives the renderer with the keyboard (no bike, no network). Use this to iterate on the UI fast. |
+| `dash_ui/` | Python package: renderer, encoder, RTP packetizer, K1G control plane, GPX parser, tile downloader. |
+| `dash_ui/prototype.py` | CLI prototype — pygame renderer, full end-to-end with the bike. |
+| `dash_ui/local_test.py` | Local dev harness — pygame renderer, keyboard-driven, no bike needed. |
+| `dash_ui/qt_renderer.py` | **Qt renderer** (PySide6): same `Renderer` protocol as pygame but with sub-pixel text, smooth gradients, and a live map view. |
+| `dash_ui/qt_prototype.py` | CLI prototype — Qt renderer, full end-to-end with the bike. |
+| `dash_ui/qt_local_test.py` | **Qt local dev harness** — opens a Mac window, keyboard-driven, no bike needed. |
+| `dash_ui/gpx.py` | Zero-dependency GPX 1.0/1.1 parser + arc-length walker. |
+| `dash_ui/tiles.py` | XYZ slippy-map tile math, on-disk cache layout, and polite OSM downloader. |
+| `dash_ui/download_tiles.py` | CLI tool — bulk pre-fetch tiles along a GPX corridor before a ride. |
+| `gpx_files/` | Sample GPX tracks. Includes `Section of Leh-Manali Highway.gpx`. |
+| `icons/` | PNG icons used by the Qt UI menu. |
 | `requirements.txt` | Python dependencies. |
 
 
@@ -60,20 +71,28 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 pip install --upgrade pip
-pip install -r requirements.txt   # cryptography + pygame-ce
+pip install -r requirements.txt
 brew install ffmpeg               # macOS — script invokes the `ffmpeg` binary
                                   # On Debian/Ubuntu: sudo apt install ffmpeg
 ```
 
 `cryptography` is required for the auth handshake.  `pygame-ce` is only
 required for the interactive `dash_ui` prototype — `tripper_app_like_nav.py`
-on its own only needs `cryptography` + `ffmpeg`.
+on its own only needs `cryptography` + `ffmpeg`.  `PySide6` is required for
+the Qt renderer (`qt_renderer.py`, `qt_prototype.py`, `qt_local_test.py`).
 
 > **Note on pygame:** the upstream `pygame` package (2.6.1) has a known
 > `pygame.font` circular-import bug on Python 3.13/3.14 that makes all
 > text invisible.  We use `pygame-ce` (the community fork — 100% drop-in
 > compatible) instead.  If you already have `pygame` installed, run
 > `pip uninstall -y pygame && pip install pygame-ce`.
+
+> **Note on PySide6:** the first run of `pip install PySide6` downloads
+> ~100 MB of Qt6 wheels.  It only needs to happen once per virtual-env.
+> On a Raspberry Pi, prefer the system package
+> `sudo apt install python3-pyside6.qtgui python3-pyside6.qtwidgets`
+> or build from source — the pip wheel targets `x86_64` / `aarch64`.
+
 
 ## Connect to the dash
 
@@ -133,54 +152,180 @@ Run `python tripper_app_like_nav.py --help` for the full list (battery
 percentage, GPS-on/off, music/alarm volume placeholders, nav-info
 maneuver code, distance unit, …).
 
-## Custom UI prototype (`dash_ui`)
 
-`dash_ui` is a Python package that renders an interactive UI in pygame,
-encodes it on the fly into H.264, packetises it as RTP and ships it to
-the dash on UDP/5000.  In parallel, it listens on UDP/2002 for the
-bike's joystick events and forwards them into the renderer's event
-queue, so the dash's LEFT / RIGHT / DOWN / CLICK buttons drive the
-on-screen menu.
+## Qt UI (`dash_ui/qt_renderer`)
 
-This is what was used to record the dash photo of a four-row menu
-("Speed / Map / Music / Settings") with a yellow highlight and live
-button feedback.
+`qt_renderer.py` is a modern alternative to the pygame renderer.  It uses
+PySide6/QPainter for hardware-accelerated off-screen rendering:
+
+- Sub-pixel anti-aliased text via QFontDatabase (system fonts).
+- Smooth QLinearGradient / QRadialGradient fills.
+- QPainterPath for the map route polyline and rounded UI cards.
+- Composited alpha — soft shadows, translucent overlays.
+- Live map view: composites pre-cached XYZ tiles from disk, draws the GPX
+  polyline, and advances a bike avatar along the route at a configurable speed.
+
+Everything else (encoder, RTP packetizer, K1G handshake, button events) is
+identical to the pygame path — both renderers implement the same `Renderer`
+protocol from `dash_ui/renderer.py`.
+
+
+### Step 1 — Pre-cache tiles along the GPX track
+
+The dash has no internet connection while riding, so tiles must be downloaded
+in advance to a local `tile_cache/` directory.  The sample route included in
+this repo is a 90 km section of the **Leh–Manali Highway** (Himachal Pradesh,
+India — bbox `33.41°N 77.73°E` → `33.66°N 77.88°E`).
+
+**Download zoom levels 13 and 14** (recommended for riding — level 13 gives
+a wide overview, level 14 gives street-level detail):
+
+```bash
+source .venv/bin/activate
+
+python -m dash_ui.download_tiles \
+    "gpx_files/Section of Leh-Manali Highway.gpx" \
+    --zoom 13 --zoom 14 \
+    --mode corridor \
+    --buffer-km 1 \
+    --cache-dir tile_cache
+```
+
+Expected output (the track has 1 028 points over ~90 km):
+
+```
+Mode: corridor  (buffer 1 km, zooms [13, 14])
+  Section of Leh-Manali Highway.gpx: 1028 pts, 90.1 km, +NNN tiles
+Plan: NNN tiles total — NNN to download, 0 already cached.
+  Estimated: ~X MB, ~Y min at 80 ms/tile
+```
+
+A **dry run** (no network fetch) lets you see the tile count first:
+
+```bash
+python -m dash_ui.download_tiles \
+    "gpx_files/Section of Leh-Manali Highway.gpx" \
+    --zoom 13 --zoom 14 \
+    --dry-run
+```
+
+If you want extra margin for detours (fuel stops, exploration), use
+`--mode bbox` instead — it caches every tile inside the bounding box:
+
+```bash
+python -m dash_ui.download_tiles \
+    "gpx_files/Section of Leh-Manali Highway.gpx" \
+    --zoom 13 --zoom 14 \
+    --mode bbox \
+    --buffer-km 3 \
+    --cache-dir tile_cache
+```
+
+**Zoom level reference:**
+
+| Zoom | Coverage per tile | Typical use |
+|------|------------------|-------------|
+| 13   | ~20 km wide      | Route overview |
+| 14   | ~10 km wide      | Main navigation zoom (recommended default) |
+| 15   | ~5 km wide       | Street-level (larger download) |
+
+> **OSM fair-use note:** The public `tile.openstreetmap.org` servers are
+> donation-funded.  The downloader adds an 80 ms delay between fetches and
+> sends an honest `User-Agent` header.  For larger areas or production use,
+> point `--base-url` at a commercial tile provider (Mapbox, MapTiler) or a
+> self-hosted tile server.
+
+
+### Step 2 — Launch the Qt UI locally (no bike needed)
+
+`qt_local_test.py` opens a desktop window so you can iterate on the UI
+without the bike:
+
+```bash
+source .venv/bin/activate
+
+python -m dash_ui.qt_local_test \
+    --gpx-dir gpx_files \
+    --tile-cache tile_cache \
+    --nav-zoom 14 \
+    --scale 2
+```
+
+This opens a 1052×600 window (526×300 dash resolution ×2).  The UI
+navigates with the keyboard:
+
+| Key | Bike button | Action |
+|-----|-------------|--------|
+| `←` / `a` | LEFT | Scroll left / previous item |
+| `→` / `d` | RIGHT | Scroll right / next item |
+| `↓` / `s` / `↑` / `w` / Enter / Space | DOWN | Activate / open / back |
+| Esc / `q` | — | Quit |
+
+Optional flags:
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--scale` | 2 | Window scale factor (2 → 1052×600) |
+| `--fps-cap` | 30 | Wall-clock refresh rate for the local window |
+| `--ui-fps` | 12 | Renderer frame rate (controls animation timing) |
+| `--nav-zoom` | 14 | OSM zoom level for the map screen |
+| `--nav-speed-kmh` | 80 | Simulated bike speed along the GPX track |
+| `--gpx-dir` | `gpx_files` | Folder scanned for `.gpx` files |
+| `--tile-cache` | `tile_cache` | Pre-cached tile pyramid |
+| `--calibration-grid` | off | Show alignment grid instead of the menu |
+
+
+### Step 3 — Stream the Qt UI to the dash
+
+Once tiles are cached and the Mac is joined to the dash's Wi-Fi:
+
+```bash
+source .venv/bin/activate
+
+python -m dash_ui.qt_prototype \
+    --ssid RE_xxxx_yymmdd \
+    --gpx-dir gpx_files \
+    --tile-cache tile_cache \
+    --nav-zoom 14 \
+    --fps 12 \
+    --bitrate-kbps 350
+```
+
+The Qt prototype shares every flag with the pygame `prototype.py`.  The
+ones most relevant to the map view:
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--ssid` | _(required)_ | Dash Wi-Fi SSID |
+| `--gpx-dir` | `gpx_files` | GPX folder scanned by the GPS Tracks menu |
+| `--tile-cache` | `tile_cache` | Pre-cached tile pyramid |
+| `--nav-zoom` | 14 | OSM zoom level for the map basemap |
+| `--nav-speed-kmh` | 20 | Simulated speed along the GPX track |
+| `--fps` | 12 | Encoder frame rate |
+| `--bitrate-kbps` | 300 | H.264 bitrate (300–450 is reliable at 12 fps) |
+| `--fake-buttons` | off | Inject LEFT/RIGHT/DOWN on a 1.5 s timer |
+| `--no-auth` | off | Skip RSA handshake (experiments only) |
+
+Run `python -m dash_ui.qt_prototype --help` for the full flag list.
+
+
+## Custom UI prototype (`dash_ui` — pygame renderer)
+
+`dash_ui` also ships a pygame-based prototype for environments where
+PySide6 is not available.
 
 ### Local development (no bike needed)
-
-The fastest iteration loop: `local_test.py` opens a Mac window with
-the same renderer the dash sees, and maps the Mac keyboard to the
-same `Button` events `bike_link.py` would deliver from UDP/2002.
 
 ```bash
 source .venv/bin/activate
 python -m dash_ui.local_test --scale 2   # 1052x600 window (526x300 ×2)
 ```
 
-| Key | Bike button |
-|---|---|
-| ← / `a` | LEFT |
-| → / `d` | RIGHT |
-| ↓ / `s` / ↑ / `w` | DOWN (bike has no UP) |
-| Enter / Space | CLICK |
-| Esc / `q` | quit |
-
 ### Stream the UI to the dash
-
-Once your Mac is on the dash's Wi-Fi (same prerequisites as the
-plain video stream above):
 
 ```bash
 python -m dash_ui.prototype --ssid RE_xxxx_yymmdd --fps 12
 ```
-
-You should see:
-
-1. The same UI you saw in `local_test.py` appear on the dash's TFT.
-2. Pressing the joystick on the bike (LEFT / RIGHT / DOWN / CLICK)
-   moves the highlight and toggles the detail panel.
-3. Selecting **Video** + DOWN plays the file passed to `--video-file`
-   (defaults to `test_640.mp4` in the working directory).
 
 Useful flags for the prototype:
 
@@ -192,8 +337,7 @@ Useful flags for the prototype:
 | `--rtp-payload` | 1380 | Max RTP payload bytes. Lower to 1000/1200 if you see Wi-Fi loss. |
 | `--video-file` | `test_640.mp4` | File played by the **Video** menu item. |
 | `--calibration-grid` | off | Stream a grid + concentric circles instead of the menu — useful for finding the round dash's safe area. |
-| `--windowed` | off | Also show the renderer in a Mac window for debugging. |
-| `--fake-buttons` | off | Inject LEFT/RIGHT/DOWN/CLICK on a 1.5 s timer (for verifying the UI reacts before the bike is on). |
+| `--fake-buttons` | off | Inject LEFT/RIGHT/DOWN/CLICK on a 1.5 s timer. |
 | `--no-auth` | off | Skip the RSA handshake (protocol experiments only). |
 
 ### Bike-side button events
@@ -214,16 +358,16 @@ event to the renderer via the `on_button` callback.
 
 ### How to extend the UI
 
-`dash_ui/pygame_renderer.py` is the only file you need to edit to
-change the look.  Modify `MENU_ITEMS`, the `_apply()` button handler,
-and `_draw()` to add new screens / behaviours; everything else
-(encoder, RTP packetizer, K1G handshake, button RX, route-card
-keep-alive) is plumbing you do not need to touch.
+To change the look, edit the renderer file that matches your stack:
 
-If you want to write a renderer that isn't pygame (e.g. an OpenGL
-off-screen framebuffer or a web view), implement the `Renderer`
-protocol from `dash_ui/renderer.py` — it's just `width`, `height`,
-`fps`, and `render_frame() → bytes` (RGB24).
+- **Qt:** `dash_ui/qt_renderer.py` — modify `MENU_ITEMS`, `_apply()`,
+  and `_draw_*()` methods.
+- **pygame:** `dash_ui/pygame_renderer.py` — same approach.
+
+Both renderers implement the `Renderer` protocol from `dash_ui/renderer.py`
+(`width`, `height`, `fps`, `render_frame() → bytes` in RGB24).  Any renderer
+that satisfies that protocol works with `DashUIStream` unchanged.
+
 
 ## Disclaimer
 
