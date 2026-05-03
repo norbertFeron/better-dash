@@ -17,6 +17,7 @@ Same key bindings as ``dash_ui.local_test``:
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 
 from PySide6.QtCore import Qt, QTimer
@@ -94,6 +95,10 @@ def main(argv: list[str]) -> int:
     args = p.parse_args(argv)
 
     app = QApplication.instance() or QApplication(sys.argv)
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    _sigint_timer = QTimer()
+    _sigint_timer.start(200)
+    _sigint_timer.timeout.connect(lambda: None)
     renderer = QtRenderer(
         headless=True,
         calibration_grid=args.calibration_grid,

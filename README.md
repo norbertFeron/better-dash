@@ -63,6 +63,10 @@ plane plus the H.264/RTP video stream — enough to take the dash from
 
 ## Install
 
+> **Running on a Raspberry Pi?** See [PI_SETUP.md](PI_SETUP.md) for the
+> headless, on-the-bike setup (auto-Wi-Fi, systemd autostart, the
+> `tmpfs`/wheel-size gotchas).
+
 ```bash
 git clone <this repo>
 cd better-dash
@@ -88,10 +92,9 @@ the Qt renderer (`qt_renderer.py`, `qt_prototype.py`, `qt_local_test.py`).
 > `pip uninstall -y pygame && pip install pygame-ce`.
 
 > **Note on PySide6:** the first run of `pip install PySide6` downloads
-> ~100 MB of Qt6 wheels.  It only needs to happen once per virtual-env.
-> On a Raspberry Pi, prefer the system package
-> `sudo apt install python3-pyside6.qtgui python3-pyside6.qtwidgets`
-> or build from source — the pip wheel targets `x86_64` / `aarch64`.
+> ~100 MB of Qt6 wheels. It only needs to happen once per virtual-env.
+> On a Raspberry Pi, see [PI_SETUP.md](PI_SETUP.md) — there are a couple
+> of gotchas (64-bit OS required, redirect pip's tmp away from RAM).
 
 
 ## Connect to the dash
