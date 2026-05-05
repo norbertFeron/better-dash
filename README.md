@@ -99,10 +99,11 @@ the Qt renderer (`qt_renderer.py`, `qt_prototype.py`, `qt_local_test.py`).
 
 ## Connect to the dash
 
-1. On the bike, enable the Tripper Wi-Fi (the menu shows the SSID and
+1. Ensure your Tripper dash is in 'Digital' mode: (`up arrow` to activate settings menu) > `Appearance` > `Screen Type` > `Digital`
+2. On the bike, enable the Tripper Wi-Fi (the menu shows the SSID and
    the AP comes up as something like `RE_xxxx_yymmdd`).
-2. On the Mac, join that Wi-Fi network. The password is **`12345678`**.
-3. Confirm you got an IP on the `192.168.1.x` subnet. The dash itself
+3. On the Mac, join that Wi-Fi network. The password is **`12345678`**.
+4. Confirm you got an IP on the `192.168.1.x` subnet. The dash itself
    is **`192.168.1.1`**.
 
 ```bash
