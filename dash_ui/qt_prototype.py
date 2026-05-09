@@ -49,7 +49,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--nav-zoom", type=int, default=14,
                    help="Zoom level for the navigation basemap (typical 13-15).")
     p.add_argument("--nav-speed-kmh", type=float, default=20.0,
-                   help="Simulated bike speed along the GPX track.")
+                   help="Simulated bike speed along the GPX track (ignored when --gps-port is set).")
+    p.add_argument("--gps-port", default=None,
+                   help="Serial port for real GPS (e.g. /dev/ttyS0). Overrides the simulation.")
     p.add_argument("--fake-buttons", action="store_true")
     return p.parse_args(argv)
 
@@ -67,6 +69,7 @@ def main(argv: list[str]) -> int:
         tile_cache=args.tile_cache,
         nav_zoom=args.nav_zoom,
         nav_speed_kmh=args.nav_speed_kmh,
+        gps_port=args.gps_port,
     )
 
     def on_button(btn: Button) -> None:

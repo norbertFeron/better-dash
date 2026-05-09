@@ -56,6 +56,65 @@ sudo apt install -y \
   libxcb-cursor0 libxkbcommon-x11-0 libgl1
 ```
 
+---
+
+## 2b. (Optional) Wire a NEO-6M GPS module
+
+Skip this section if you want to run the navigation simulation without real GPS.
+
+### Wiring
+
+| GPS Pin | Raspberry Pi Pin | GPIO |
+|---|---|---|
+| VCC | Pin 1 (3.3 V) | — |
+| GND | Pin 6 | — |
+| TXD | Pin 10 | GPIO 15 (RXD) |
+| RXD | Pin 8 | GPIO 14 (TXD) |
+| PPS | _(not needed)_ | — |
+
+> Use **3.3 V**, not 5 V. The Pi's GPIO is 3.3 V logic.
+
+### Enable UART on the Pi
+
+```bash
+sudo raspi-config
+# Interface Options → Serial Port
+#   Login shell over serial? → No
+#   Serial port hardware enabled? → Yes
+sudo reboot
+```
+
+### Verify raw NMEA output
+
+```bash
+cat /dev/ttyS0
+```
+
+You should see `$GPRMC` sentences within a minute (outdoor antenna, clear sky).
+The `A` status field means an active fix — e.g. `$GPRMC,…,A,…`.
+
+### Install GPS Python packages
+
+The GPS deps are not in the main `requirements.txt` install because they
+are optional and unavailable via pip when the Pi is on the bike's offline
+WiFi AP. Install them once while the Pi has internet access:
+
+```bash
+pip install pyserial pynmea2
+```
+
+**If the Pi has no internet** (e.g. it's already on the bike AP), download
+the wheels on your laptop and copy them over:
+
+```bash
+# On your laptop:
+pip download pyserial pynmea2 -d /tmp/gps-wheels
+scp /tmp/gps-wheels/*.whl <user>@<pi-hostname>:~/
+
+# On the Pi:
+pip install ~/pyserial*.whl ~/pynmea2*.whl
+```
+
 `ffmpeg` is mandatory — the streamer shells out to it for H.264
 encoding. The three `lib*` packages are the runtime libs Qt needs at
 import time, even when running headless.
@@ -207,6 +266,22 @@ python -m dash_ui.qt_prototype \
     --bitrate-kbps 300
 ```
 
+To use a real GPS module instead of the simulated track position, add
+`--gps-port`:
+
+```bash
+python -m dash_ui.qt_prototype \
+    --ssid RE_xxxx_yymmdd \
+    --gps-port /dev/ttyS0 \
+    --nav-zoom 15 \
+    --fps 12 \
+    --bitrate-kbps 350
+```
+
+When a valid fix arrives the nav screen centres on your real position and
+the status pill shows `·GPS`. If the fix is lost for more than 5 seconds
+the renderer holds the last known position until it comes back.
+
 Expected sequence in the logs:
 
 1. `[bike_link] UDP/2000 → 192.168.1.255 …`
@@ -223,24 +298,57 @@ Bike joystick events (LEFT / RIGHT / DOWN / CLICK) appear as
 ## 8. (Optional) Auto-launch on boot
 
 Run the streamer as a systemd service so the Pi starts driving the dash
-the moment ignition powers it on. Save as
-`/etc/systemd/system/better-dash.service` (replace `<USER>` with your Pi
-account name and adjust the path):
+the moment ignition powers it on.
+
+### Wrapper script (waits for bike WiFi before launching)
+
+The bike's AP may not be reachable immediately after boot. This script
+polls until the connection is up, then hands off to the prototype:
+
+```bash
+nano ~/start-dash.sh
+```
+
+```bash
+#!/bin/bash
+until nmcli con show --active | grep -q RE_xxxx_yymmdd; do
+    echo "Waiting for bike WiFi..."
+    sleep 3
+done
+echo "Bike WiFi up — starting dash"
+exec /home/<USER>/better-dash/.venv/bin/python -m dash_ui.qt_prototype \
+    --ssid RE_xxxx_yymmdd \
+    --gps-port /dev/ttyS0 \
+    --nav-zoom 15 \
+    --fps 12 \
+    --bitrate-kbps 350
+```
+
+```bash
+chmod +x ~/start-dash.sh
+```
+
+Remove `--gps-port` if you are not using a hardware GPS module.
+
+### Systemd service
+
+Save as `/etc/systemd/system/better-dash.service` (replace `<USER>` with
+your Pi account name):
 
 ```ini
 [Unit]
 Description=better-dash Tripper streamer
-After=network-online.target
-Wants=network-online.target
+After=network.target
 
 [Service]
 Type=simple
 User=<USER>
 WorkingDirectory=/home/<USER>/better-dash
-ExecStart=/home/<USER>/better-dash/.venv/bin/python -m dash_ui.qt_prototype \
-    --ssid RE_xxxx_yymmdd --fps 10 --bitrate-kbps 300
+ExecStart=/home/<USER>/start-dash.sh
 Restart=on-failure
 RestartSec=5
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -253,6 +361,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now better-dash.service
 journalctl -u better-dash -f      # follow the logs
 ```
+
+If the bike WiFi drops mid-ride and the stream dies, `Restart=on-failure`
+restarts the service and the wrapper script waits for the WiFi to come
+back before relaunching.
 
 ---
 
@@ -267,3 +379,7 @@ journalctl -u better-dash -f      # follow the logs
 | Dash stays on loading dots / logo loop | Network-level issue. `ping 192.168.1.1` from the Pi. If it fails, the Pi didn't join the dash AP. |
 | Choppy frames | Lower `--fps` (8 or 6) and `--bitrate-kbps` (200). Watch CPU with `htop` from a second SSH session. |
 | Ctrl+C leaves the script printing Qt warnings | Should already be fixed in `qt_local_test.py` — pull the latest. |
+| `ImportError: pyserial and pynmea2 are required` | Install GPS deps: `pip install pyserial pynmea2`. If no internet, use the offline wheel method in §2b. |
+| `cat /dev/ttyS0` shows nothing | UART not enabled. Run `raspi-config → Interface Options → Serial Port` and set hardware enabled / no login shell, then reboot. |
+| GPS fix never arrives (no `A` in `$GPRMC`) | Antenna needs clear sky. Cold start takes up to 60 s outdoors. Indoors it will not fix. |
+| Nav screen doesn't centre on real position | Fix not yet active — the status pill will show `·SIM` until a valid GPRMC sentence arrives. |

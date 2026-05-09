@@ -30,6 +30,7 @@ Threading model
 from __future__ import annotations
 
 import collections
+import json
 import math
 import os
 import shutil
@@ -68,8 +69,14 @@ try:
 except ImportError:  # pragma: no cover
     Button = None  # type: ignore[assignment]
 
-from dash_ui.gpx import Track, list_gpx, parse_gpx
+from dash_ui.gpx import Track, list_gpx, next_turn, parse_gpx
 from dash_ui.map_view import TileCache, render_basemap
+
+try:
+    from dash_ui.gps_reader import GpsReader
+    _HAS_GPS = True
+except ImportError:
+    _HAS_GPS = False
 
 
 MENU_ITEMS = ("Open Map", "GPS Tracks", "Settings")
@@ -78,7 +85,11 @@ GPS_ITEM = "GPS Tracks"
 SETTINGS_ITEM = "Settings"
 
 # Settings rows.  Index 0 is always "Back"; DOWN on it closes the screen.
-_SETTINGS_ROWS = ("Back", "View")
+_SETTINGS_ROWS = ("Back", "View", "Turn Arrow", "Compass")
+
+# Compass display modes.
+_COMPASS_MODES  = ("bubble", "bar")
+_COMPASS_LABELS = {"bubble": "Top bubble", "bar": "Bottom bar"}
 
 # Map view modes — cycled via DOWN on the "View" row in Settings.
 #   north   : top-down, N is always up (default).
@@ -165,6 +176,7 @@ class QtRenderer:
         tile_cache: str | Path = "tile_cache",
         nav_zoom: int = 14,
         nav_speed_kmh: float = 20.0,
+        gps_port: str | None = None,
     ) -> None:
         if not _HAS_QT:
             raise ImportError(
@@ -224,7 +236,8 @@ class QtRenderer:
         self._pending: Deque["Button"] = collections.deque(maxlen=16)
         self._selected = 0
         self._click_counts = [0] * len(MENU_ITEMS)
-        self._map_open = False
+        self._map_open = False       # GPS Tracks picker / nav simulation
+        self._live_map_open = False  # Open Map — live GPS view
         self._video_open = False
         self._settings_open = False
         self._last_button_name: str | None = None
@@ -260,6 +273,24 @@ class QtRenderer:
         # Settings cursor — also includes a "Back" row at index 0.
         self._settings_index = 1  # cursor on first real setting
 
+        # Real GPS reader (optional — falls back to simulation when None or no fix).
+        self._gps: "GpsReader | None" = None
+        if gps_port:
+            if not _HAS_GPS:
+                print(
+                    "[QtRenderer] --gps-port ignored: pyserial/pynmea2 not installed.",
+                    flush=True,
+                )
+            else:
+                self._gps = GpsReader(port=gps_port)
+                self._gps.start()
+                print(f"[QtRenderer] GPS reader started on {gps_port}", flush=True)
+
+        # Last known GPS position — persists across fix gaps so the map
+        # doesn't jump to 0,0 on a brief signal loss.
+        self._last_lat: float = 0.0
+        self._last_lon: float = 0.0
+
         # Live nav-simulation state.
         self._nav_open = False
         self._nav_track: Track | None = None
@@ -269,6 +300,12 @@ class QtRenderer:
         self._nav_arc_m = 0.0
         self._nav_last_tick: float | None = None
         self._nav_missing_tiles = 0
+
+        # Persisted settings.
+        self._nav_turn_arrow: bool = True
+        self._compass_mode: str = "bubble"
+        self._settings_path = Path("settings.json")
+        self._load_settings()
 
     # =========================================================== Renderer API
 
@@ -289,6 +326,8 @@ class QtRenderer:
                 self._draw_calibration(p)
             elif self._video_open:
                 self._draw_video(p)
+            elif self._live_map_open:
+                self._draw_live_map_screen(p)
             elif self._map_open:
                 self._draw_map_screen(p)
             elif self._settings_open:
@@ -306,6 +345,8 @@ class QtRenderer:
 
     def close(self) -> None:
         self._stop_video()
+        if self._gps is not None:
+            self._gps.stop()
         # Don't quit the QGuiApplication — other QtRenderer instances
         # (or a local-test window) may still need it.
 
@@ -364,26 +405,27 @@ class QtRenderer:
                 self._stop_video()
             return
 
-        # ----------------------------------------------------- Map sub-flow
+        # ----------------------------------------------------- Live map
+        if self._live_map_open:
+            if button is Button.LEFT:
+                self._nav_zoom = max(self._NAV_ZOOM_MIN, self._nav_zoom - 1)
+            elif button is Button.RIGHT:
+                self._nav_zoom = min(self._NAV_ZOOM_MAX, self._nav_zoom + 1)
+            elif button is Button.DOWN:
+                self._live_map_open = False
+            return
+
+        # ----------------------------------------------------- GPS Tracks sub-flow
         if self._map_open:
             if self._nav_open:
-                # ---- Navigation simulation --------------------------
-                # LEFT  = zoom out, RIGHT = zoom in.  Clamped to the
-                # OSM range that's actually useful for navigation:
-                #   - z=10 (~150 m / px @ equator) → wide overview
-                #   - z=18 (~0.6 m / px) → street level
-                # Tiles outside the pre-downloaded zooms will trigger
-                # the "missing tiles" warning chip.
                 if button is Button.DOWN:
-                    self._picker_index = self._nav_file_index + 1  # +1 for Back row
+                    self._picker_index = self._nav_file_index + 1
                     self._close_nav()
                 elif button is Button.LEFT:
                     self._nav_zoom = max(self._NAV_ZOOM_MIN, self._nav_zoom - 1)
                 elif button is Button.RIGHT:
                     self._nav_zoom = min(self._NAV_ZOOM_MAX, self._nav_zoom + 1)
                 return
-
-            # ---- GPX file picker (index 0 = "Back" row) -------------
             n_items = 1 + len(self._gpx_files)
             if button is Button.LEFT:
                 self._picker_index = (self._picker_index - 1) % n_items
@@ -391,11 +433,9 @@ class QtRenderer:
                 self._picker_index = (self._picker_index + 1) % n_items
             elif button is Button.DOWN:
                 if self._picker_index == 0:
-                    # Back row → close picker.
                     self._map_open = False
                 else:
-                    file_idx = self._picker_index - 1
-                    self._open_nav(self._gpx_files[file_idx])
+                    self._open_nav(self._gpx_files[self._picker_index - 1])
             return
 
         # ----------------------------------------------------- Settings
@@ -416,17 +456,43 @@ class QtRenderer:
             self._selected = (self._selected + 1) % len(MENU_ITEMS)
         elif button is Button.DOWN:
             label = MENU_ITEMS[self._selected]
-            if label in (MAP_ITEM, GPS_ITEM):
+            if label == MAP_ITEM:
+                self._live_map_open = True
+            elif label == GPS_ITEM:
                 # Re-scan the gpx folder so dropping a new file in
                 # there shows up without restarting.
                 self._gpx_files = list_gpx(self._gpx_dir)
-                # Park the cursor on the first track when files exist;
-                # otherwise it stays on the Back row.
                 self._picker_index = 1 if self._gpx_files else 0
                 self._map_open = True
             elif label == SETTINGS_ITEM:
                 self._settings_index = 1  # cursor on first real setting
                 self._settings_open = True
+
+    def _load_settings(self) -> None:
+        try:
+            data = json.loads(self._settings_path.read_text())
+            vm = data.get("view_mode", "north")
+            self._view_mode = vm if vm in _VIEW_MODES else "north"
+            self._nav_turn_arrow = bool(data.get("turn_arrow", True))
+            cm = data.get("compass_mode", "bubble")
+            self._compass_mode = cm if cm in _COMPASS_MODES else "bubble"
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, OSError):
+            pass  # silently keep defaults
+
+    def _save_settings(self) -> None:
+        try:
+            self._settings_path.write_text(
+                json.dumps(
+                    {
+                        "view_mode": self._view_mode,
+                        "turn_arrow": self._nav_turn_arrow,
+                        "compass_mode": self._compass_mode,
+                    },
+                    indent=2,
+                )
+            )
+        except OSError as exc:
+            print(f"[QtRenderer] could not save settings: {exc}", file=sys.stderr)
 
     def _activate_setting(self, idx: int) -> None:
         if idx == 0:
@@ -435,6 +501,14 @@ class QtRenderer:
         elif _SETTINGS_ROWS[idx] == "View":
             cur = _VIEW_MODES.index(self._view_mode)
             self._view_mode = _VIEW_MODES[(cur + 1) % len(_VIEW_MODES)]
+            self._save_settings()
+        elif _SETTINGS_ROWS[idx] == "Turn Arrow":
+            self._nav_turn_arrow = not self._nav_turn_arrow
+            self._save_settings()
+        elif _SETTINGS_ROWS[idx] == "Compass":
+            cur = _COMPASS_MODES.index(self._compass_mode)
+            self._compass_mode = _COMPASS_MODES[(cur + 1) % len(_COMPASS_MODES)]
+            self._save_settings()
 
     # ============================================================ Drawing
 
@@ -930,6 +1004,74 @@ class QtRenderer:
             p.setPen(Qt.PenStyle.NoPen)
             p.drawEllipse(QPointF(cx, cy), 3, 3)
 
+    # ============================================================ Live map
+
+    def _draw_live_map_screen(self, p: QPainter) -> None:
+        """Open Map: full-screen basemap centred on the current GPS position."""
+        fix = self._gps.get_fix() if self._gps is not None else None
+        if fix is not None:
+            self._last_lat = fix.lat
+            self._last_lon = fix.lon
+
+        lat = self._last_lat
+        lon = self._last_lon
+        has_fix = fix is not None
+
+        cx = self.width / 2
+        cy = self.height / 2
+
+        p.fillRect(0, 0, self.width, self.height, QBrush(_BG_TOP))
+
+        if lat != 0.0 or lon != 0.0:
+            basemap, _project, missing = render_basemap(
+                self.width, self.height, lat, lon, self._nav_zoom,
+                self._tile_cache_dir, tile_cache=self._tile_cache_obj,
+            )
+            p.drawImage(0, 0, basemap)
+            p.fillRect(0, 0, self.width, self.height, QBrush(QColor(0, 0, 0, 40)))
+
+            if has_fix:
+                self._draw_bike_avatar(p, cx, cy, fix.bearing)
+            else:
+                # Faded crosshair for last-known position.
+                pen = QPen(QColor(255, 255, 255, 100), 1.5)
+                p.setPen(pen)
+                p.drawLine(int(cx) - 10, int(cy), int(cx) + 10, int(cy))
+                p.drawLine(int(cx), int(cy) - 10, int(cx), int(cy) + 10)
+
+            if missing > 0:
+                self._draw_missing_tiles_warning(p, missing)
+        else:
+            # No position at all yet.
+            self._draw_background(p)
+
+        # HUD
+        self._draw_tag(p, "MAP", 14, 12, _ACCENT_GREEN)
+        zoom_label = f"Z {self._nav_zoom}"
+        if self._nav_zoom == self._NAV_ZOOM_MIN:
+            zoom_label += " ·MIN"
+        elif self._nav_zoom == self._NAV_ZOOM_MAX:
+            zoom_label += " ·MAX"
+        self._draw_tag(p, zoom_label, 14, 36, _ACCENT_A)
+        live_bearing = fix.bearing if has_fix else 0.0
+        if self._compass_mode == "bubble":
+            self._draw_compass(p, self.width // 2, 20)
+        else:
+            self._draw_compass_bar(p, live_bearing)
+        _scale_y = self.height - 60 if self._compass_mode == "bar" else self.height - 28
+        self._draw_scale_bar(p, 16, _scale_y, lat=lat)
+
+        if has_fix:
+            speed_kmh = fix.speed_kmh
+            self._draw_status_pill(p, f"{speed_kmh:4.0f} km/h ·GPS   {_VIEW_LABELS[self._view_mode]}")
+        elif lat != 0.0 or lon != 0.0:
+            self._draw_status_pill(p, "LAST KNOWN   NO FIX")
+        else:
+            self._draw_status_pill(p, "WAITING FOR GPS")
+
+        if self._compass_mode != "bar":
+            self._draw_back_hint(p, "LEFT zoom out   RIGHT zoom in   DOWN back")
+
     # ============================================================ Map sub-flow
 
     def _draw_map_screen(self, p: QPainter) -> None:
@@ -1329,8 +1471,16 @@ class QtRenderer:
         track = self._nav_track
         assert track is not None
 
-        self._advance_simulation()
-        lat, lon, bearing = track.position_at_meters(self._nav_arc_m)
+        fix = self._gps.get_fix() if self._gps is not None else None
+        if fix is not None:
+            lat, lon, bearing = fix.lat, fix.lon, fix.bearing
+            speed_kmh = fix.speed_kmh
+            # Keep arc progress in sync with real position for the progress bar.
+            self._nav_arc_m = track.nearest_arc_m(lat, lon)
+        else:
+            self._advance_simulation()
+            lat, lon, bearing = track.position_at_meters(self._nav_arc_m)
+            speed_kmh = self._nav_speed_mps * 3600 / 1000
 
         cx = self.width / 2
         cy = self.height / 2
@@ -1418,21 +1568,31 @@ class QtRenderer:
             zoom_label += " ·MAX"
         self._draw_tag(p, zoom_label, 14, 36, _ACCENT_A)
 
-        # Compass — needle counter-rotates so N still points north.
+        # Compass — bubble at top-centre or scrolling bar at bottom.
         compass_rot = 0.0 if self._view_mode == "north" else -bearing
-        self._draw_compass(p, self.width - 30, 24, rot_deg=compass_rot)
+        if self._compass_mode == "bubble":
+            self._draw_compass(p, self.width // 2, 20, rot_deg=compass_rot)
+        else:
+            self._draw_compass_bar(p, bearing)
 
-        # Bottom-left scale bar — auto-recomputed from zoom + latitude.
-        self._draw_scale_bar(p, 16, self.height - 28, lat=lat)
+        # Bottom-left scale bar — lifted above the compass bar when in bar mode.
+        _scale_y = self.height - 60 if self._compass_mode == "bar" else self.height - 28
+        self._draw_scale_bar(p, 16, _scale_y, lat=lat)
 
-        # Top-centre status pill: track name + speed.
-        speed_kmh = self._nav_speed_mps * 3600 / 1000
+        # Top-centre status pill: track name + speed (real GPS or simulated).
+        gps_marker = " ·GPS" if fix is not None else ""
         name = (self._nav_track_path.stem if self._nav_track_path else track.name)
-        if len(name) > 22:
-            name = name[:21] + "…"
+        if len(name) > 18:
+            name = name[:17] + "…"
         self._draw_status_pill(
-            p, f"{name}   {speed_kmh:4.0f} km/h   {_VIEW_LABELS[self._view_mode]}",
+            p, f"{name}   {speed_kmh:4.0f} km/h{gps_marker}   {_VIEW_LABELS[self._view_mode]}",
         )
+
+        # Turn indicator — only when enabled and a turn is within lookahead range.
+        if self._nav_turn_arrow:
+            turn_info = next_turn(track, self._nav_arc_m)
+            if turn_info is not None:
+                self._draw_turn_panel(p, *turn_info)
 
         # Bottom progress bar.
         progress = self._nav_arc_m / track.total_m if track.total_m > 0 else 0.0
@@ -1441,7 +1601,11 @@ class QtRenderer:
         if missing > 0:
             self._draw_missing_tiles_warning(p, missing)
 
-        self._draw_back_hint(p, "LEFT zoom out   RIGHT zoom in   DOWN back")
+        if self._compass_mode == "bar":
+            # Bar occupies the bottom zone; skip the text hint there.
+            pass
+        else:
+            self._draw_back_hint(p, "LEFT zoom out   RIGHT zoom in   DOWN back")
 
     # ----- View-mode blit helpers -----------------------------------
 
@@ -1568,6 +1732,130 @@ class QtRenderer:
         p.drawPolygon(arrow)
         p.restore()
 
+    # ------------------------------------------------------------ Turn panel
+
+    def _draw_turn_panel(self, p: QPainter, dist_m: float,
+                         turn_deg: float) -> None:
+        """Navigation turn indicator — right-center of the round display."""
+        # Card geometry (fits inside the circular safe area).
+        x, y, w, h = 313, 78, 72, 60
+        card = QRectF(x, y, w, h)
+
+        # Accent border colour shifts warm→hot as the turn gets closer.
+        if dist_m < 150:
+            border = _ACCENT_C
+        elif dist_m < 400:
+            r_blend = (400 - dist_m) / 250
+            border = QColor(
+                int(_ACCENT_A.red()   + (_ACCENT_C.red()   - _ACCENT_A.red())   * r_blend),
+                int(_ACCENT_A.green() + (_ACCENT_C.green() - _ACCENT_A.green()) * r_blend),
+                int(_ACCENT_A.blue()  + (_ACCENT_C.blue()  - _ACCENT_A.blue())  * r_blend),
+            )
+        else:
+            border = _ACCENT_A
+
+        p.setBrush(QBrush(QColor(0x08, 0x0F, 0x20, 215)))
+        p.setPen(QPen(QColor(border.red(), border.green(), border.blue(), 160), 1.2))
+        p.drawRoundedRect(card, 10, 10)
+
+        # Arrow (centred horizontally, fills most of the card height).
+        arrow_cx = x + w / 2
+        arrow_cy = y + 30
+        self._draw_turn_arrow(p, arrow_cx, arrow_cy, 40, turn_deg)
+
+        # Distance label.
+        if dist_m < 1000:
+            dist_str = f"{int(dist_m)} m"
+        else:
+            dist_str = f"{dist_m / 1000:.1f} km"
+        p.setFont(self._font_meta)
+        p.setPen(QPen(_TEXT_HI))
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(dist_str)
+        p.drawText(int(x + w / 2 - tw / 2), int(y + h - 6), dist_str)
+
+    def _draw_turn_arrow(self, p: QPainter, cx: float, cy: float,
+                         size: float, turn_deg: float) -> None:
+        """Turn direction arrow centred at (cx, cy) within a `size`×`size` box."""
+        abs_a = abs(turn_deg)
+        s = 1.0 if turn_deg >= 0 else -1.0
+        r = size * 0.5
+
+        color = _ACCENT_C
+        pen = QPen(color, max(2.0, r * 0.13),
+                   Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                   Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+        if abs_a < 15:
+            # Straight ahead — vertical shaft + arrowhead.
+            path = QPainterPath()
+            path.moveTo(cx, cy + r * 0.75)
+            path.lineTo(cx, cy - r * 0.30)
+            p.drawPath(path)
+            self._draw_arrow_tip(p, cx, cy - r * 0.30, 0.0, -1.0, r * 0.30, color)
+
+        elif abs_a > 150:
+            # U-turn — stem up, semicircle, back down.
+            uw = r * 0.40
+            sx = cx - s * uw   # stem side
+            rx = cx + s * uw   # return side
+            top_y = cy - r * 0.15
+            path = QPainterPath()
+            path.moveTo(sx, cy + r * 0.75)
+            path.lineTo(sx, top_y)
+            arc_rect = QRectF(
+                min(sx, rx), top_y - uw * 2,
+                abs(rx - sx), uw * 2,
+            )
+            start_angle = 270.0
+            sweep = 180.0 if s > 0 else -180.0
+            path.arcTo(arc_rect, start_angle, sweep)
+            path.lineTo(rx, cy + r * 0.40)
+            p.drawPath(path)
+            self._draw_arrow_tip(p, rx, cy + r * 0.40, 0.0, 1.0, r * 0.30, color)
+
+        else:
+            # Normal turn — vertical stem + bezier curve to the tip.
+            visual_deg = min(abs_a * 0.85, 88.0)
+            visual_rad = math.radians(visual_deg)
+            tip_x = cx + s * r * 0.82 * math.sin(visual_rad)
+            tip_y = cy - r * 0.82 * math.cos(visual_rad)
+            # Elbow: where the straight stem meets the curve.
+            elbow_y = cy - r * 0.25
+            # Quadratic control point pulls the curve towards the turn side.
+            ctrl_x = cx + s * r * 0.40 * math.sin(visual_rad)
+            ctrl_y = elbow_y - r * 0.10
+            path = QPainterPath()
+            path.moveTo(cx, cy + r * 0.75)
+            path.lineTo(cx, elbow_y)
+            path.quadTo(QPointF(ctrl_x, ctrl_y), QPointF(tip_x, tip_y))
+            p.drawPath(path)
+            # Arrowhead tangent to the curve at the tip (approx: ctrl→tip direction).
+            dx = tip_x - ctrl_x
+            dy = tip_y - ctrl_y
+            dl = math.sqrt(dx * dx + dy * dy) or 1.0
+            self._draw_arrow_tip(p, tip_x, tip_y,
+                                 dx / dl, dy / dl, r * 0.30, color)
+
+    def _draw_arrow_tip(
+        self, p: QPainter,
+        tx: float, ty: float,
+        dx: float, dy: float,
+        aw: float,
+        color: "QColor",
+    ) -> None:
+        """Filled arrowhead triangle at (tx, ty) pointing in direction (dx, dy)."""
+        px, py = -dy, dx          # perpendicular
+        al = aw * 1.2             # length (forward)
+        tip  = QPointF(tx + dx * al,           ty + dy * al)
+        bl   = QPointF(tx + px * aw,           ty + py * aw)
+        br   = QPointF(tx - px * aw,           ty - py * aw)
+        p.setBrush(QBrush(color))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawPolygon(QPolygonF([tip, bl, br]))
+
     def _draw_status_pill(self, p: QPainter, text: str) -> None:
         p.setFont(self._font_meta)
         fm = p.fontMetrics()
@@ -1592,18 +1880,26 @@ class QtRenderer:
         ratio = max(0.0, min(1.0, ratio))
         y = self.height - 44
         x, w = self._safe_band(y, y + 8, extra_margin=8)
-        p.setBrush(QBrush(QColor(255, 255, 255, 24)))
+        # Track (more opaque so it reads over any tile colour).
+        p.setBrush(QBrush(QColor(255, 255, 255, 55)))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRoundedRect(QRectF(x, y, w, 4), 2, 2)
         p.setBrush(QBrush(_ACCENT_GREEN))
         p.drawRoundedRect(QRectF(x, y, w * ratio, 4), 2, 2)
 
-        p.setFont(self._font_meta)
-        p.setPen(QPen(_TEXT_LO))
+        # Readout with dark pill for contrast.
         done_km = (ratio * total_m) / 1000.0
         total_km = total_m / 1000.0
         readout = f"{done_km:5.1f} / {total_km:5.1f} km"
-        p.drawText(int(x), int(y - 3), readout)
+        p.setFont(self._font_meta)
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(readout)
+        pill = QRectF(x - 3, y - fm.ascent() - 4, tw + 10, fm.ascent() + fm.descent() + 4)
+        p.setBrush(QBrush(QColor(0x08, 0x0F, 0x20, 190)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(pill, 4, 4)
+        p.setPen(QPen(_TEXT_HI))
+        p.drawText(int(x + 2), int(y - 3), readout)
 
     def _draw_missing_tiles_warning(self, p: QPainter, missing: int) -> None:
         text = f"{missing} tiles missing — run dash_ui.download_tiles"
@@ -1634,11 +1930,10 @@ class QtRenderer:
         behind modes, pass ``rot_deg=-bearing`` so the N still points
         towards true north on screen.
         """
-        # Static dial (background pill stays put — the world rotates,
-        # not the bezel).
-        p.setBrush(QBrush(QColor(255, 255, 255, 18)))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(QPointF(cx, cy), 14, 14)
+        # Dark bubble matching the turn-card style.
+        p.setBrush(QBrush(QColor(0x08, 0x0F, 0x20, 215)))
+        p.setPen(QPen(QColor(_ACCENT_A.red(), _ACCENT_A.green(), _ACCENT_A.blue(), 160), 1.2))
+        p.drawEllipse(QPointF(cx, cy), 20, 20)
 
         # Rotated needle + label.
         p.save()
@@ -1671,6 +1966,83 @@ class QtRenderer:
         p.restore()
         p.restore()
 
+    def _draw_compass_bar(self, p: QPainter, bearing_deg: float) -> None:
+        """Scrolling compass bar at the bottom of the display.
+
+        Drawn full-width; the physical round bezel clips the corners
+        naturally, giving a classic navigation-style appearance.
+        """
+        bar_h = 26
+        bar_y = self.height - bar_h - 2   # sits just above the bezel edge
+        cx = float(self.width // 2)
+
+        # Dark full-width background — bezel clips corners.
+        p.setBrush(QBrush(QColor(0x08, 0x0F, 0x20, 220)))
+        p.setPen(QPen(QColor(_ACCENT_A.red(), _ACCENT_A.green(), _ACCENT_A.blue(), 100), 1.0))
+        p.drawRoundedRect(QRectF(0, bar_y, self.width, bar_h), 6, 6)
+
+        # Compass scale: 1.5 px per degree.
+        px_per_deg = 1.5
+
+        compass_points = {
+            0: "N", 45: "NE", 90: "E", 135: "SE",
+            180: "S", 225: "SW", 270: "W", 315: "NW",
+        }
+
+        # Iterate all 15° steps, computing each one's screen x.
+        for step in range(0, 360, 15):
+            # Angular offset from current bearing, normalised to [-180, 180].
+            offset = ((step - bearing_deg) + 180.0) % 360.0 - 180.0
+            px_x = cx + offset * px_per_deg
+
+            if px_x < 0 or px_x > self.width:
+                continue
+
+            is_cardinal      = step in (0, 90, 180, 270)
+            is_intercardinal = step in (45, 135, 225, 315)
+
+            if is_cardinal:
+                tick_h = 14
+                color  = _ACCENT_C if step == 0 else _TEXT_HI
+            elif is_intercardinal:
+                tick_h = 9
+                color  = _TEXT_LO
+            else:
+                tick_h = 5
+                color  = _TEXT_DIM
+
+            # Tick hanging down from the top of the bar.
+            p.setPen(QPen(color, 1.2 if is_cardinal else 1.0))
+            p.drawLine(QPointF(px_x, bar_y + 2),
+                       QPointF(px_x, bar_y + 2 + tick_h))
+
+            # Label below the tick (cardinals + intercardinals only).
+            if step in compass_points and (is_cardinal or is_intercardinal):
+                label = compass_points[step]
+                p.setFont(self._font_tag)
+                p.setPen(QPen(color))
+                fm = p.fontMetrics()
+                tw = fm.horizontalAdvance(label)
+                p.drawText(
+                    int(px_x - tw / 2),
+                    int(bar_y + 2 + tick_h + fm.ascent() + 1),
+                    label,
+                )
+
+        # Centre cursor — bright vertical hairline with a triangle cap.
+        p.setPen(QPen(_ACCENT_C, 1.5,
+                      Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(QPointF(cx, bar_y + 1), QPointF(cx, bar_y + bar_h - 1))
+        # Small downward triangle at the top of the cursor.
+        tri = QPolygonF([
+            QPointF(cx, bar_y + 7),
+            QPointF(cx - 4, bar_y + 1),
+            QPointF(cx + 4, bar_y + 1),
+        ])
+        p.setBrush(QBrush(_ACCENT_C))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawPolygon(tri)
+
     def _draw_scale_bar(self, p: QPainter, x: int, y: int,
                          *, lat: float = 0.0) -> None:
         """Auto-scaled bar — picks a "nice" round distance for the current
@@ -1686,20 +2058,30 @@ class QtRenderer:
         chosen_m = min(nice, key=lambda v: abs(v - target_m))
         bar_px = max(20, int(chosen_m / mpp))
 
-        p.setPen(QPen(_TEXT_LO, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.SquareCap))
-        p.drawLine(x, y, x + bar_px, y)
-        # Four ticks (start + 3 quarters + end).
-        for i in range(5):
-            tx = x + int(i * bar_px / 4)
-            p.drawLine(tx, y - 3, tx, y + 3)
-
         if chosen_m < 1000:
             label = f"{chosen_m} m"
         else:
             km = chosen_m / 1000
             label = f"{km:g} km"
+
+        # Dark pill behind bar + label for contrast over any map tile.
         p.setFont(self._font_meta)
-        p.setPen(QPen(_TEXT_LO))
+        fm = p.fontMetrics()
+        lw = fm.horizontalAdvance(label)
+        pill = QRectF(x - 5, y - 7, bar_px + lw + 18, 18)
+        p.setBrush(QBrush(QColor(0x08, 0x0F, 0x20, 190)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(pill, 5, 5)
+
+        # Bar line and ticks.
+        p.setPen(QPen(_TEXT_HI, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.SquareCap))
+        p.drawLine(x, y, x + bar_px, y)
+        for i in range(5):
+            tx = x + int(i * bar_px / 4)
+            p.drawLine(tx, y - 4, tx, y + 4)
+
+        # Label.
+        p.setPen(QPen(_TEXT_HI))
         p.drawText(x + bar_px + 6, y + 4, label)
 
     def _draw_tag(self, p: QPainter, text: str, x: int, y: int, colour: QColor) -> None:
@@ -1726,8 +2108,15 @@ class QtRenderer:
         values = {
             "View": (
                 _VIEW_LABELS[self._view_mode],
-                # Spread the dot across the bar — 0 / 0.5 / 1 for the 3 modes.
                 view_pos / max(1, len(_VIEW_MODES) - 1),
+            ),
+            "Turn Arrow": (
+                "On" if self._nav_turn_arrow else "Off",
+                1.0 if self._nav_turn_arrow else 0.0,
+            ),
+            "Compass": (
+                _COMPASS_LABELS[self._compass_mode],
+                _COMPASS_MODES.index(self._compass_mode) / max(1, len(_COMPASS_MODES) - 1),
             ),
         }
 

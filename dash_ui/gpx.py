@@ -98,6 +98,19 @@ class Track:
         bearing = initial_bearing_deg(a.lat, a.lon, b.lat, b.lon)
         return (lat, lon, bearing)
 
+    def nearest_arc_m(self, lat: float, lon: float) -> float:
+        """Return the arc-length (m) of the track point closest to (lat, lon)."""
+        if not self.points or not self.cumulative_m:
+            return 0.0
+        best_i = 0
+        best_d = float("inf")
+        for i, p in enumerate(self.points):
+            d = haversine_m(lat, lon, p.lat, p.lon)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return self.cumulative_m[best_i]
+
     def decimated(self, max_points: int = 600) -> list[TrackPoint]:
         """Return a thinned copy for cheap polyline rendering."""
         n = len(self.points)
@@ -188,3 +201,61 @@ def list_gpx(folder: Path) -> list[Path]:
     if not folder.is_dir():
         return []
     return sorted(folder.glob("*.gpx"))
+
+
+def next_turn(
+    track: Track,
+    arc_m: float,
+    *,
+    lookahead_m: float = 1200.0,
+    min_angle_deg: float = 25.0,
+    smooth_m: float = 40.0,
+) -> tuple[float, float] | None:
+    """Return (distance_m, turn_angle_deg) for the next significant turn ahead.
+
+    Computes the bearing change at each candidate point using a ±smooth_m window
+    to filter out GPS jitter in dense tracks.  Returns None if no turn exceeding
+    min_angle_deg is found within lookahead_m.
+
+    turn_angle_deg is signed: positive = right, negative = left, range [-180, 180].
+    """
+    n = len(track.points)
+    if n < 3 or not track.cumulative_m:
+        return None
+
+    cum = track.cumulative_m
+    pts = track.points
+
+    start_i = bisect.bisect_right(cum, arc_m)
+    start_i = max(1, min(start_i, n - 2))
+    limit_m = arc_m + lookahead_m
+
+    for j in range(start_i, n - 1):
+        if cum[j] > limit_m:
+            break
+
+        # Incoming bearing: from the point ~smooth_m before j.
+        k = bisect.bisect_left(cum, cum[j] - smooth_m, 0, j + 1)
+        k = max(0, min(k, j - 1))
+
+        # Outgoing bearing: to the point ~smooth_m after j.
+        m_idx = bisect.bisect_left(cum, cum[j] + smooth_m, j + 1, n)
+        m_idx = min(m_idx, n - 1)
+        if m_idx <= j:
+            m_idx = min(j + 1, n - 1)
+
+        if k == j or m_idx == j:
+            continue
+
+        bearing_in = initial_bearing_deg(
+            pts[k].lat, pts[k].lon, pts[j].lat, pts[j].lon
+        )
+        bearing_out = initial_bearing_deg(
+            pts[j].lat, pts[j].lon, pts[m_idx].lat, pts[m_idx].lon
+        )
+        delta = (bearing_out - bearing_in + 180.0) % 360.0 - 180.0
+
+        if abs(delta) >= min_angle_deg:
+            return (cum[j] - arc_m, delta)
+
+    return None
